@@ -147,7 +147,9 @@ jobs:
           libavcodec-dev libavformat-dev libavutil-dev libswresample-dev
 
       # The core package is meant to build anywhere, including targets with
-      # no native decoder and no cgo, where it falls back to ffmpeg.
+      # no native decoder and no cgo, where it falls back to ffmpeg. The
+      # 32-bit Windows target is the only place internal/mf/callback_32.go
+      # is compiled, which is the whole reason it is listed.
       - name: Build the core package for every target
         shell: bash
         run: |
@@ -161,6 +163,7 @@ jobs:
           linux arm64 0
           windows amd64 1
           windows amd64 0
+          windows 386 0
           darwin arm64 0
           freebsd amd64 0
           TARGETS
@@ -180,5 +183,6 @@ jobs:
           linux amd64 1
           windows amd64 1
           windows amd64 0
+          windows 386 0
           darwin arm64 0
           TARGETS
