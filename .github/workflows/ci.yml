@@ -89,6 +89,31 @@ jobs:
           done
           exit 1
 
+      # ASan gets its own pass because it and the race detector cannot both
+      # instrument the same build. It is here for the linked ffmpeg
+      # backend: that C side allocates with av_malloc, which the leak test
+      # cannot see, since it reads Go's heap profile and so counts only Go
+      # allocations. Nothing else in the suite would notice it leaking.
+      - name: Test under AddressSanitizer
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -o pipefail
+          if go test -asan -count=1 -timeout 5m ./... 2>&1 | tee asan.log; then
+            exit 0
+          fi
+          {
+            echo "### AddressSanitizer failures"
+            echo '```'
+            grep -E '^(--- |FAIL|panic)|_test\.go:|ERROR: (Address|Leak)Sanitizer|SUMMARY:' asan.log | head -100
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          grep -E '^(--- FAIL|FAIL|panic)|ERROR: (Address|Leak)Sanitizer|SUMMARY:' asan.log | head -30 | while IFS= read -r line; do
+            echo "::error::asan: $line"
+          done
+          exit 1
+
       # The support matrix in the readme is meant to be measured rather
       # than copied from vendor documentation, and this is where the
       # measuring happens. Notices are readable without signing in, so
