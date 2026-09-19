@@ -4,7 +4,10 @@
 //
 //	Windows: Media Foundation
 //	  macOS: AudioToolbox
-//	  Linux: ffmpeg
+//	  Linux: ffmpeg's libraries, linked
+//
+// Built without cgo, and on any other operating system, the ffmpeg
+// binary is run as a subprocess instead.
 //
 // Output is always signed 16-bit little-endian PCM, which is directly
 // playable and is what the common Go audio stacks expect. The play
@@ -126,9 +129,9 @@ type Format struct {
 // Stream decodes compressed audio held in memory, returning PCM through
 // an [io.Reader] rather than a single buffer.
 //
-// The returned Stream must be closed. Only the Windows backend decodes
-// incrementally today; elsewhere the audio is decoded up front and
-// served from memory, which is correct but saves nothing.
+// The returned Stream must be closed. The Windows and Linux backends
+// decode incrementally; macOS and the subprocess fallback decode up
+// front and serve from memory, which is correct but saves nothing.
 func (d *Decoder) Stream(compressed []byte) (*Stream, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
@@ -147,10 +150,10 @@ func (d *Decoder) Stream(compressed []byte) (*Stream, error) {
 // StreamFile decodes the audio file at path, returning PCM through an
 // [io.Reader] rather than a single buffer.
 //
-// The returned Stream must be closed. Backends that shell out to ffmpeg
-// pipe the decode directly, so the PCM is never held whole; the Windows
-// backend reads the compressed file into memory first, which is small
-// next to the PCM it avoids buffering.
+// The returned Stream must be closed. The Linux backend and the
+// subprocess fallback read the file directly, so the PCM is never held
+// whole; the Windows backend reads the compressed file into memory
+// first, which is small next to the PCM it avoids buffering.
 func (d *Decoder) StreamFile(path string) (*Stream, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()

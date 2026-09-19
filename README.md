@@ -14,12 +14,21 @@ licenses for.
 Windows is implemented via the Media Foundation and macOS is implemented
 on AudioToolbox/AVFoundation.
 
-Other platforms including Linux shell out to FFmpeg.
+Linux links FFmpeg's libraries directly. Other platforms, and any build
+without cgo, run the FFmpeg binary as a sub-process instead.
 
-FFmpeg's libraries are LGPL, which Go's static linking does not sit well
-with, and running it as a sub-process keeps both the licence question and
-the patent question with whoever installed it. We take the performance hit
-for that.
+The linking is dynamic, which is the case LGPL exists to permit. The
+original concern was Go's *static* linking, which LGPL genuinely does not
+sit well with; dynamic linking does not raise it. Nothing is vendored or
+redistributed either way, so the patent question still sits with whoever
+installed FFmpeg.
+
+One caveat worth knowing. Many distributions build FFmpeg with
+`--enable-gpl`, which makes the libraries GPL rather than LGPL; Arch's is
+GPL-3.0. The FSF's position is that linking, statically or dynamically,
+makes a combined work, so anyone shipping a binary linked against such a
+build inherits that obligation. Building with `CGO_ENABLED=0` selects the
+sub-process path, which is arm's length and raises no such question.
 
 
 `go get git.sr.ht/~jackmordaunt/nativeaudio`
@@ -66,8 +75,8 @@ play.File("audio.m4a")
 - `Decoder.StreamFile(path)` and `Decoder.Stream(data)` return a `Stream`,
   an `io.Reader` over the same PCM, so a long track never has to sit in
   memory whole. `Format` is known before the first read. Close it when
-  done. Windows decodes incrementally and the ffmpeg backend pipes; macOS
-  currently decodes up front and serves from memory.
+  done. Windows and Linux decode incrementally, and the sub-process
+  backend pipes; macOS currently decodes up front and serves from memory.
 - `Format` reports `SampleRate`, `Channels` and `BytesPerSample`, which is
   always 2.
 - A `Decoder` is safe for concurrent use, and `Close` waits for decodes
@@ -156,4 +165,3 @@ ship by default.
 ## TODO 
 
 - [ ] macOS: decode incrementally rather than buffering behind `Stream`
-- [ ] Linux: something better then shelling out to FFmpeg
