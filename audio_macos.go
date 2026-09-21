@@ -51,6 +51,7 @@ import (
 	"os"
 	"runtime"
 	"runtime/cgo"
+	"sync"
 	"sync/atomic"
 	"unsafe"
 )
@@ -63,37 +64,62 @@ func end() error {
 	return nil
 }
 
-func load(path string) (_ []byte, f Format, _ error) {
-	inputf, err := os.Open(path)
-	if err != nil {
-		return nil, f, err
-	}
+// macStream decodes incrementally through an AudioConverter.
+//
+// The converter was always a pull loop: each FillComplexBuffer asks the
+// input proc for as much compressed audio as it needs and hands back a
+// chunk of PCM. Buffering the whole decode was only a matter of running
+// that loop to completion up front, so streaming is the same loop driven
+// one chunk at a time rather than a second pipeline.
+type macStream struct {
+	mu     sync.Mutex
+	pinner runtime.Pinner
 
-	defer inputf.Close()
+	inputFile *AudioFile
+	converter *AudioConverter
+	icHandle  cgo.Handle
 
-	inputBuf, err := io.ReadAll(inputf)
-	if err != nil {
-		return nil, f, err
-	}
+	format Format
 
-	return decode(inputBuf)
+	// chunk is the scratch the converter fills. pending is the part of it
+	// Read has not handed over yet, so a caller reading in small pieces
+	// does not cost a conversion per call.
+	chunk   []byte
+	pending []byte
+
+	packetsPerChunk C.UInt32
+	drained         bool
+	closed          bool
 }
 
-func decode(buf []byte) (_ []byte, f Format, _ error) {
-	var pinner runtime.Pinner
-	defer pinner.Unpin()
+// newMacStream builds the AudioToolbox pipeline over compressed audio
+// held in memory. The returned stream owns everything allocated here and
+// must be closed.
+func newMacStream(buf []byte) (_ *macStream, err error) {
+	// Enough output packets to keep the converter busy without holding
+	// much: one output packet is a frame, so this is 40KB of stereo, a
+	// quarter second at 44.1kHz. The buffered decode used the same number
+	// to favour throughput, and at this size it costs nothing to stream.
+	s := &macStream{packetsPerChunk: 10000}
+
+	// Everything below is released by Close, including when the setup
+	// fails partway and the caller never receives the stream.
+	defer func() {
+		if err != nil {
+			s.Close()
+		}
+	}()
 
 	// Allocate an "AudioFile" backed by a byte slice. The handle inside
 	// keeps buf reachable for as long as AudioToolbox can call back, so
 	// neither the slice nor its data needs pinning.
 	inputFile, err := OpenAudioFileBuffer(buf)
 	if err != nil {
-		return nil, f, fmt.Errorf("opening file with callbacks: %w", err)
+		return nil, fmt.Errorf("opening file with callbacks: %w", err)
 	}
 
-	defer inputFile.Dispose()
-
-	pinner.Pin(inputFile)
+	s.inputFile = inputFile
+	s.pinner.Pin(inputFile)
 
 	// Query the input format.
 	var inputDescription C.AudioStreamBasicDescription
@@ -103,7 +129,7 @@ func decode(buf []byte) (_ []byte, f Format, _ error) {
 		C.UInt32(unsafe.Sizeof(inputDescription)),
 		unsafe.Pointer(&inputDescription),
 	); err != nil {
-		return nil, f, fmt.Errorf("querying for property kAudioFilePropertyDataFormat: %w", err)
+		return nil, fmt.Errorf("querying for property kAudioFilePropertyDataFormat: %w", err)
 	}
 
 	var inputUsesPacketDescriptions C.Boolean
@@ -130,14 +156,14 @@ func decode(buf []byte) (_ []byte, f Format, _ error) {
 	// This handles the conversion between audio formats.
 	audioConverter, err := NewAudioConverter(&inputDescription, &outputDescription)
 	if err != nil {
-		return nil, f, fmt.Errorf("creating audio converter: %w", err)
+		return nil, fmt.Errorf("creating audio converter: %w", err)
 	}
 
-	defer audioConverter.Dispose()
+	s.converter = audioConverter
 
 	magicCookieSize, err := inputFile.GetPropertySize(C.kAudioFilePropertyMagicCookieData)
 	if err != nil {
-		return nil, f, fmt.Errorf("getting magic cookie property: %w", err)
+		return nil, fmt.Errorf("getting magic cookie property: %w", err)
 	}
 
 	// If a magic cookie exists in the input, set it on the AudioConverter.
@@ -152,14 +178,14 @@ func decode(buf []byte) (_ []byte, f Format, _ error) {
 	if magicCookieSize > 0 {
 		magicCookie := make([]byte, 0, magicCookieSize)
 
-		pinner.Pin(unsafe.SliceData(magicCookie))
+		s.pinner.Pin(unsafe.SliceData(magicCookie))
 
 		if _, err := inputFile.GetProperty(
 			C.kAudioFilePropertyMagicCookieData,
 			magicCookieSize,
 			unsafe.Pointer(unsafe.SliceData(magicCookie)),
 		); err != nil {
-			return nil, f, fmt.Errorf("getting magic cookie: %w", err)
+			return nil, fmt.Errorf("getting magic cookie: %w", err)
 		}
 
 		if err := audioConverter.SetProperty(
@@ -167,24 +193,19 @@ func decode(buf []byte) (_ []byte, f Format, _ error) {
 			magicCookieSize,
 			unsafe.Pointer(unsafe.SliceData(magicCookie)),
 		); err != nil {
-			return nil, f, fmt.Errorf("setting magic cookie: %w", err)
+			return nil, fmt.Errorf("setting magic cookie: %w", err)
 		}
 	}
 
-	var (
-		maxInputPacketSize  C.UInt32
-		maxOutputPacketSize C.UInt32
-	)
+	var maxInputPacketSize C.UInt32
 
 	if _, err := inputFile.GetProperty(
 		C.kAudioFilePropertyMaximumPacketSize,
 		C.UInt32(unsafe.Sizeof(maxInputPacketSize)),
 		unsafe.Pointer(&maxInputPacketSize),
 	); err != nil {
-		return nil, f, fmt.Errorf("getting maximum packet size from input: %w", err)
+		return nil, fmt.Errorf("getting maximum packet size from input: %w", err)
 	}
-
-	maxOutputPacketSize = outputDescription.mBytesPerPacket
 
 	// Allocate the InputContext.
 	// This is a structure that we define and use within the [InputDataProc].
@@ -196,65 +217,129 @@ func decode(buf []byte) (_ []byte, f Format, _ error) {
 		inputUsesPacketDescriptions,
 	)
 
-	pinner.Pin(unsafe.SliceData(ic.mPacketDescriptions))
+	s.pinner.Pin(unsafe.SliceData(ic.mPacketDescriptions))
 
 	// The converter keeps this caller data across callbacks, so it goes
 	// across as a handle rather than as a Go pointer.
-	icHandle := cgo.NewHandle(ic)
-	defer icHandle.Delete()
+	s.icHandle = cgo.NewHandle(ic)
 
-	// Adjusting this will tradeoff latency against throughput.
-	// Given that we aren't streaming, throughput is preferable.
-	packetsPerLoop := C.UInt32(10000)
+	s.chunk = make([]byte, int(s.packetsPerChunk)*int(outputDescription.mBytesPerPacket))
+	s.pinner.Pin(unsafe.SliceData(s.chunk))
 
-	// packet buffer holds valid packet data. Re-used between iterations.
-	packetBuffer := make([]byte, 0, packetsPerLoop*maxOutputPacketSize)
-	pinner.Pin(unsafe.Pointer(unsafe.SliceData(packetBuffer)))
+	s.format = Format{
+		SampleRate:     int(outputDescription.mSampleRate),
+		Channels:       int(outputDescription.mChannelsPerFrame),
+		BytesPerSample: int(outputDescription.mBitsPerChannel / 8),
+	}
 
-	// Perform the conversion, collecting the results into a Go byte slice.
+	return s, nil
+}
 
-	var out []byte
+// Format describes the PCM this stream produces, known before any audio
+// is read.
+func (s *macStream) Format() Format { return s.format }
 
-	for {
-		numPackets := packetsPerLoop
+// Read fills p with decoded PCM, returning io.EOF once the input is
+// exhausted.
+func (s *macStream) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
 
-		// Initialize AudioBufferList with a single buffer because we are
-		// working with interleaved PCM samples. mDataByteSize is an in-out
-		// variable, and will contain the number of bytes copied to the
-		// buffer after the call to FillComplexBuffer.
-		abl := C.AudioBufferList{
-			mNumberBuffers: 1,
-			mBuffers: [1]C.AudioBuffer{{
-				mNumberChannels: outputDescription.mChannelsPerFrame,
-				mDataByteSize:   C.UInt32(cap(packetBuffer)), // in: capacity, out: length
-				mData:           unsafe.Pointer(unsafe.SliceData(packetBuffer)),
-			}},
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.closed {
+		return 0, io.EOF
+	}
+
+	for len(s.pending) == 0 {
+		if s.drained {
+			return 0, io.EOF
 		}
-
-		if err := audioConverter.FillComplexBuffer(
-			(C.AudioConverterComplexInputDataProc)(C.InputDataProc),
-			C.handleToPointer(C.uintptr_t(icHandle)),
-			&numPackets,
-			&abl,
-			nil,
-		); err != nil {
-			return nil, f, fmt.Errorf("filling buffer: %w", err)
-		}
-
-		if numPackets > 0 {
-			out = append(out, packetBuffer[:abl.mBuffers[0].mDataByteSize]...)
-		}
-
-		if numPackets < packetsPerLoop {
-			break
+		if err := s.fill(); err != nil {
+			return 0, err
 		}
 	}
 
-	f.Channels = int(outputDescription.mChannelsPerFrame)
-	f.BytesPerSample = int(outputDescription.mBitsPerChannel / 8)
-	f.SampleRate = int(outputDescription.mSampleRate)
+	n := copy(p, s.pending)
+	s.pending = s.pending[n:]
 
-	return out, f, nil
+	return n, nil
+}
+
+// fill runs one turn of the converter loop.
+func (s *macStream) fill() error {
+	numPackets := s.packetsPerChunk
+
+	// Initialize AudioBufferList with a single buffer because we are
+	// working with interleaved PCM samples. mDataByteSize is an in-out
+	// variable, and will contain the number of bytes copied to the
+	// buffer after the call to FillComplexBuffer.
+	abl := C.AudioBufferList{
+		mNumberBuffers: 1,
+		mBuffers: [1]C.AudioBuffer{{
+			mNumberChannels: C.UInt32(s.format.Channels),
+			mDataByteSize:   C.UInt32(len(s.chunk)), // in: capacity, out: length
+			mData:           unsafe.Pointer(unsafe.SliceData(s.chunk)),
+		}},
+	}
+
+	if err := s.converter.FillComplexBuffer(
+		(C.AudioConverterComplexInputDataProc)(C.InputDataProc),
+		C.handleToPointer(C.uintptr_t(s.icHandle)),
+		&numPackets,
+		&abl,
+		nil,
+	); err != nil {
+		return fmt.Errorf("filling buffer: %w", err)
+	}
+
+	s.pending = s.chunk[:abl.mBuffers[0].mDataByteSize]
+
+	// A short fill means the input ran out. This is the same signal the
+	// buffered loop used to decide it had reached the end, and the chunk
+	// carrying it still holds audio, so it is served before io.EOF.
+	if numPackets < s.packetsPerChunk {
+		s.drained = true
+	}
+
+	return nil
+}
+
+// Close releases the pipeline. It is safe to call more than once, and
+// abandoning a stream before io.EOF is fine as long as it is closed.
+func (s *macStream) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.closed {
+		return nil
+	}
+
+	s.closed = true
+	s.pending = nil
+
+	// Order matters here. The converter can call back into the input
+	// file, so it is torn down first; the handle those callbacks resolve
+	// stays valid until it cannot be reached; and nothing is unpinned
+	// while AudioToolbox could still be holding a pointer to it.
+	//
+	// AudioFile.Dispose is not idempotent, which is what the closed flag
+	// above is guarding.
+	if s.converter != nil {
+		s.converter.Dispose()
+	}
+	if s.inputFile != nil {
+		s.inputFile.Dispose()
+	}
+	if s.icHandle != 0 {
+		s.icHandle.Delete()
+	}
+
+	s.pinner.Unpin()
+
+	return nil
 }
 
 const (
@@ -622,21 +707,21 @@ func (e ErrOSStatus) Error() string {
 	return fmt.Sprintf("%v", C.OSStatus(e))
 }
 
-// openStream decodes up front and serves the result from memory.
-// AudioToolbox can decode incrementally, but this backend does not yet.
+// openStream decodes incrementally through AudioToolbox.
 func openStream(by []byte) (*Stream, error) {
-	pcm, format, err := decode(by)
+	ms, err := newMacStream(by)
 	if err != nil {
 		return nil, err
 	}
-	return newBufferedStream(pcm, format), nil
+	return &Stream{r: ms, format: ms.Format()}, nil
 }
 
-// openStreamFile decodes up front and serves the result from memory.
+// openStreamFile buffers the compressed file, which is small next to the
+// PCM the stream avoids holding, then decodes it incrementally.
 func openStreamFile(path string) (*Stream, error) {
-	pcm, format, err := load(path)
+	by, err := os.ReadFile(path)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("reading input file: %w", err)
 	}
-	return newBufferedStream(pcm, format), nil
+	return openStream(by)
 }
