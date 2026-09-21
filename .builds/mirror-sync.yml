@@ -8,5 +8,5 @@ tasks:
       ssh-keyscan github.com >> ~/.ssh/known_hosts
       git clone --mirror https://git.sr.ht/~jackmordaunt/nativeaudio
       cd nativeaudio
-      git remote set-url --push origin git@github.com:jackmordaunt/go-nativeaudio.git
+      git remote set-url --push origin git@github.com:JackMordaunt/nativeaudio.git
       git push --mirror
