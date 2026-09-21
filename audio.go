@@ -129,9 +129,10 @@ type Format struct {
 // Stream decodes compressed audio held in memory, returning PCM through
 // an [io.Reader] rather than a single buffer.
 //
-// The returned Stream must be closed. The Windows and Linux backends
-// decode incrementally; macOS and the subprocess fallback decode up
-// front and serve from memory, which is correct but saves nothing.
+// The returned Stream must be closed. Every native backend decodes
+// incrementally; only the subprocess fallback decodes up front and
+// serves from memory, because ffmpeg cannot read every container this
+// package supports from a pipe.
 func (d *Decoder) Stream(compressed []byte) (*Stream, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
@@ -152,8 +153,8 @@ func (d *Decoder) Stream(compressed []byte) (*Stream, error) {
 //
 // The returned Stream must be closed. The Linux backend and the
 // subprocess fallback read the file directly, so the PCM is never held
-// whole; the Windows backend reads the compressed file into memory
-// first, which is small next to the PCM it avoids buffering.
+// whole; Windows and macOS read the compressed file into memory first,
+// which is small next to the PCM it avoids buffering.
 func (d *Decoder) StreamFile(path string) (*Stream, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
